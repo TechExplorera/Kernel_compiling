@@ -1,5 +1,5 @@
 # .github/workflows/fetch-toolchain.yml
-name: Descargar y Subir Toolchain
+name: Descargar y Subir Toolchain al Repo
 
 on:
   workflow_dispatch:
@@ -21,10 +21,10 @@ on:
         description: 'URL directa (solo si toolchain_type=custom-url)'
         required: false
         default: ''
-      release_name:
-        description: 'Nombre para el release/artifact final'
+      output_dir:
+        description: 'Carpeta destino dentro del repo para el toolchain'
         required: true
-        default: 'toolchain'
+        default: 'prebuilts/toolchain'
 
 permissions:
   contents: write
@@ -37,6 +37,8 @@ jobs:
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Liberar espacio en disco
         run: |
@@ -76,26 +78,27 @@ jobs:
 
       - name: Descargar toolchain
         run: |
-          mkdir -p toolchain_download
-          cd toolchain_download
+          mkdir -p /tmp/toolchain_download
+          cd /tmp/toolchain_download
           FILENAME=$(basename "${{ steps.resolve.outputs.download_url }}")
           curl -L --fail -o "$FILENAME" "${{ steps.resolve.outputs.download_url }}"
           echo "FILENAME=$FILENAME" >> $GITHUB_ENV
           ls -lh
 
-      - name: Extraer contenido
+      - name: Extraer directamente en el repo
         run: |
-          mkdir -p toolchain_extracted
-          cd toolchain_download
+          rm -rf "${{ inputs.output_dir }}"
+          mkdir -p "${{ inputs.output_dir }}"
+          cd /tmp/toolchain_download
           case "$FILENAME" in
             *.tar.xz)
-              tar -xJf "$FILENAME" -C ../toolchain_extracted
+              tar -xJf "$FILENAME" -C "$GITHUB_WORKSPACE/${{ inputs.output_dir }}"
               ;;
             *.tar.gz|*.tgz)
-              tar -xzf "$FILENAME" -C ../toolchain_extracted
+              tar -xzf "$FILENAME" -C "$GITHUB_WORKSPACE/${{ inputs.output_dir }}"
               ;;
             *.zip)
-              unzip -q "$FILENAME" -d ../toolchain_extracted
+              unzip -q "$FILENAME" -d "$GITHUB_WORKSPACE/${{ inputs.output_dir }}"
               ;;
             *)
               echo "Formato desconocido, no se pudo extraer: $FILENAME"
@@ -103,32 +106,14 @@ jobs:
               ;;
           esac
           echo "Contenido extraído:"
-          find ../toolchain_extracted -maxdepth 2
+          find "$GITHUB_WORKSPACE/${{ inputs.output_dir }}" -maxdepth 2
+          echo "Tamaño total:"
+          du -sh "$GITHUB_WORKSPACE/${{ inputs.output_dir }}"
 
-      - name: Comprimir extraído como zip para subir
+      - name: Commit y push al repo
         run: |
-          cd toolchain_extracted
-          zip -qr "../${{ inputs.release_name }}-${{ github.run_number }}.zip" .
-          cd ..
-          ls -lh "${{ inputs.release_name }}-${{ github.run_number }}.zip"
-
-      - name: Subir contenido extraído como artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ inputs.release_name }}-${{ github.run_number }}
-          path: toolchain_extracted/
-          retention-days: 30
-
-      - name: Crear release con el contenido extraído
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ inputs.release_name }}-${{ github.run_number }}
-          name: ${{ inputs.release_name }} (run #${{ github.run_number }})
-          files: ${{ inputs.release_name }}-${{ github.run_number }}.zip
-          body: |
-            Toolchain descargado y extraído automáticamente.
-            - Tipo: ${{ inputs.toolchain_type }}
-            - Versión: ${{ inputs.version }}
-            - URL origen: ${{ steps.resolve.outputs.download_url }}
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          git config --global user.email "actions@github.com"
+          git config --global user.name "GitHub Actions"
+          git add "${{ inputs.output_dir }}"
+          git diff --cached --quiet && echo "Nada que commitear" && exit 0
+          git commit -m "Add extracted toolcha
