@@ -1,44 +1,44 @@
-# .github/workflows/fetch-toolchain.yml
-name: Descargar y Subir Toolchain al Repo
+# .github/workflows/kernel-source-fetcher.yml
+name: Kernel Source Fetcher
 
 on:
   workflow_dispatch:
     inputs:
-      toolchain_type:
-        description: 'Tipo de toolchain'
+      url:
+        description: 'Link directo de descarga del kernel source (Samsung Open Source u otro)'
         required: true
+      compression:
+        description: 'Nivel de compresión para el paquete final'
+        required: true
+        default: '6'
         type: choice
         options:
-          - android-ndk
-          - arm-gnu-toolchain
-          - aosp-clang
-          - custom-url
-      version:
-        description: 'Versión (ej. r26d para NDK, 13.2.rel1 para ARM GNU, clang-r487747c para AOSP)'
-        required: false
-        default: ''
-      custom_url:
-        description: 'URL directa (solo si toolchain_type=custom-url)'
-        required: false
-        default: ''
-      output_dir:
-        description: 'Carpeta destino dentro del repo para el toolchain'
+          - '0'
+          - '3'
+          - '6'
+          - '9'
+      upload_destination:
+        description: 'Destino de subida'
         required: true
-        default: 'prebuilts/toolchain'
+        default: 'github releases'
+        type: choice
+        options:
+          - 'github releases'
+          - 'artifact'
+      strip_prebuilts:
+        description: 'Eliminar binarios prebuilt pesados innecesarios (reduce tamaño)'
+        type: boolean
+        default: true
 
 permissions:
   contents: write
 
 jobs:
   fetch:
-    runs-on: ubuntu-22.04
-    timeout-minutes: 60
-
+    runs-on: ubuntu-latest
     steps:
-      - name: Checkout repo
+      - name: Checkout code
         uses: actions/checkout@v4
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Liberar espacio en disco
         run: |
@@ -46,74 +46,99 @@ jobs:
           sudo docker image prune --all --force || true
           df -h
 
-      - name: Resolver URL de descarga
-        id: resolve
+      - name: Instalar dependencias
         run: |
-          TYPE="${{ inputs.toolchain_type }}"
-          VER="${{ inputs.version }}"
-          URL=""
+          sudo apt-get update
+          sudo apt-get install -y jq xz-utils curl unzip file
 
+      - name: Descargar kernel source
+        run: |
+          mkdir -p download
+          cd download
+          curl -L --fail \
+            -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36" \
+            -o source_package "${{ github.event.inputs.url }}"
+          file source_package
+
+      - name: Detectar tipo real y validar
+        id: detect
+        run: |
+          cd download
+          TYPE=$(file -b --mime-type source_package)
+          echo "Tipo detectado: $TYPE"
           case "$TYPE" in
-            android-ndk)
-              URL="https://dl.google.com/android/repository/android-ndk-${VER}-linux.zip"
-              ;;
-            arm-gnu-toolchain)
-              URL="https://developer.arm.com/-/media/Files/downloads/gnu/${VER}/binrel/arm-gnu-toolchain-${VER}-x86_64-aarch64-none-linux-gnu.tar.xz"
-              ;;
-            aosp-clang)
-              URL="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/${VER}.tar.gz"
-              ;;
-            custom-url)
-              URL="${{ inputs.custom_url }}"
-              ;;
-          esac
-
-          if [ -z "$URL" ]; then
-            echo "No se pudo resolver la URL. Revisa el tipo/versión."
-            exit 1
-          fi
-
-          echo "URL resuelta: $URL"
-          echo "download_url=$URL" >> "$GITHUB_OUTPUT"
-
-      - name: Descargar toolchain
-        run: |
-          mkdir -p /tmp/toolchain_download
-          cd /tmp/toolchain_download
-          FILENAME=$(basename "${{ steps.resolve.outputs.download_url }}")
-          curl -L --fail -o "$FILENAME" "${{ steps.resolve.outputs.download_url }}"
-          echo "FILENAME=$FILENAME" >> $GITHUB_ENV
-          ls -lh
-
-      - name: Extraer directamente en el repo
-        run: |
-          rm -rf "${{ inputs.output_dir }}"
-          mkdir -p "${{ inputs.output_dir }}"
-          cd /tmp/toolchain_download
-          case "$FILENAME" in
-            *.tar.xz)
-              tar -xJf "$FILENAME" -C "$GITHUB_WORKSPACE/${{ inputs.output_dir }}"
-              ;;
-            *.tar.gz|*.tgz)
-              tar -xzf "$FILENAME" -C "$GITHUB_WORKSPACE/${{ inputs.output_dir }}"
-              ;;
-            *.zip)
-              unzip -q "$FILENAME" -d "$GITHUB_WORKSPACE/${{ inputs.output_dir }}"
-              ;;
-            *)
-              echo "Formato desconocido, no se pudo extraer: $FILENAME"
+            application/zip) mv source_package source.zip; echo "ext=zip" >> "$GITHUB_OUTPUT" ;;
+            application/gzip|application/x-gzip) mv source_package source.tar.gz; echo "ext=tar.gz" >> "$GITHUB_OUTPUT" ;;
+            application/x-xz) mv source_package source.tar.xz; echo "ext=tar.xz" >> "$GITHUB_OUTPUT" ;;
+            text/html)
+              echo "❌ Se descargó una página HTML, no el archivo. El link probablemente expiró o requiere sesión."
+              head -c 300 source_package
               exit 1
               ;;
+            *) echo "❌ Tipo de archivo desconocido: $TYPE"; exit 1 ;;
+          esac
+
+      - name: Extraer paquete principal
+        run: |
+          mkdir -p extracted
+          cd download
+          EXT="${{ steps.detect.outputs.ext }}"
+          case "$EXT" in
+            zip) unzip -q "source.$EXT" -d ../extracted ;;
+            tar.gz) tar -xzf "source.$EXT" -C ../extracted ;;
+            tar.xz) tar -xJf "source.$EXT" -C ../extracted ;;
           esac
           echo "Contenido extraído:"
-          find "$GITHUB_WORKSPACE/${{ inputs.output_dir }}" -maxdepth 2
-          echo "Tamaño total:"
-          du -sh "$GITHUB_WORKSPACE/${{ inputs.output_dir }}"
+          find ../extracted -maxdepth 2
 
-      - name: Commit y push al repo
+      - name: Extraer tar anidados (kernel suele venir dentro de otro tar)
         run: |
-          git config --global user.email "actions@github.com"
-          git config --global user.name "GitHub Actions"
-          git add "${{ inputs.output_dir }}"
-          git diff --cached --quiet && echo "Nada que commitear" && exit 0
-          git commit -m "Add extracted toolcha
+          find extracted -maxdepth 3 \( -iname "*kernel*.tar.gz" -o -iname "*kernel*.tar.bz2" -o -iname "*kernel*.tar.xz" \) | while read -r inner; do
+            echo "Extrayendo anidado: $inner"
+            DEST=$(dirname "$inner")
+            tar -xf "$inner" -C "$DEST"
+          done
+          echo "Tamaño total tras extracción:"
+          du -sh extracted
+
+      - name: Eliminar prebuilts pesados innecesarios
+        if: ${{ github.event.inputs.strip_prebuilts == 'true' }}
+        run: |
+          find extracted -maxdepth 4 -type d \( -iname "prebuilt*toolchain*" -o -iname "*prebuilts*" \) -exec du -sh {} \;
+          echo "Nota: revisa arriba qué prebuilts se detectaron. Ajusta este paso si quieres borrarlos automáticamente."
+
+      - name: Empaquetar resultado
+        id: package
+        run: |
+          COMPRESSION="${{ github.event.inputs.compression }}"
+          OUTPUT="kernel_source.tar.xz"
+          tar -cf - -C extracted . | xz -${COMPRESSION} -T0 > "$OUTPUT"
+          ls -lh "$OUTPUT"
+          echo "output_file=$OUTPUT" >> "$GITHUB_OUTPUT"
+
+      - name: Obtener tag único para release
+        id: reltag
+        run: |
+          BASE_TAG="kernel-$(date +'%d%m%Y_%H%M%S')"
+          echo "release_tag=$BASE_TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Subir a GitHub Releases
+        if: ${{ github.event.inputs.upload_destination == 'github releases' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.reltag.outputs.release_tag }}
+          name: Kernel Source ${{ steps.reltag.outputs.release_tag }}
+          files: ${{ steps.package.outputs.output_file }}
+          body: |
+            Kernel source descargado automáticamente.
+            - URL origen: ${{ github.event.inputs.url }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Subir como artifact
+        if: ${{ github.event.inputs.upload_destination == 'artifact' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-source-${{ github.run_number }}
+          path: ${{ steps.package.outputs.output_file }}
+          retention-days: 14
