@@ -1,0 +1,134 @@
+# .github/workflows/fetch-toolchain.yml
+name: Descargar y Subir Toolchain
+
+on:
+  workflow_dispatch:
+    inputs:
+      toolchain_type:
+        description: 'Tipo de toolchain'
+        required: true
+        type: choice
+        options:
+          - android-ndk
+          - arm-gnu-toolchain
+          - aosp-clang
+          - custom-url
+      version:
+        description: 'Versión (ej. r26d para NDK, 13.2.rel1 para ARM GNU, clang-r487747c para AOSP)'
+        required: false
+        default: ''
+      custom_url:
+        description: 'URL directa (solo si toolchain_type=custom-url)'
+        required: false
+        default: ''
+      release_name:
+        description: 'Nombre para el release/artifact final'
+        required: true
+        default: 'toolchain'
+
+permissions:
+  contents: write
+
+jobs:
+  fetch:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Liberar espacio en disco
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          sudo docker image prune --all --force || true
+          df -h
+
+      - name: Resolver URL de descarga
+        id: resolve
+        run: |
+          TYPE="${{ inputs.toolchain_type }}"
+          VER="${{ inputs.version }}"
+          URL=""
+
+          case "$TYPE" in
+            android-ndk)
+              URL="https://dl.google.com/android/repository/android-ndk-${VER}-linux.zip"
+              ;;
+            arm-gnu-toolchain)
+              URL="https://developer.arm.com/-/media/Files/downloads/gnu/${VER}/binrel/arm-gnu-toolchain-${VER}-x86_64-aarch64-none-linux-gnu.tar.xz"
+              ;;
+            aosp-clang)
+              URL="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/${VER}.tar.gz"
+              ;;
+            custom-url)
+              URL="${{ inputs.custom_url }}"
+              ;;
+          esac
+
+          if [ -z "$URL" ]; then
+            echo "No se pudo resolver la URL. Revisa el tipo/versión."
+            exit 1
+          fi
+
+          echo "URL resuelta: $URL"
+          echo "download_url=$URL" >> "$GITHUB_OUTPUT"
+
+      - name: Descargar toolchain
+        run: |
+          mkdir -p toolchain_download
+          cd toolchain_download
+          FILENAME=$(basename "${{ steps.resolve.outputs.download_url }}")
+          curl -L --fail -o "$FILENAME" "${{ steps.resolve.outputs.download_url }}"
+          echo "FILENAME=$FILENAME" >> $GITHUB_ENV
+          ls -lh
+
+      - name: Extraer contenido
+        run: |
+          mkdir -p toolchain_extracted
+          cd toolchain_download
+          case "$FILENAME" in
+            *.tar.xz)
+              tar -xJf "$FILENAME" -C ../toolchain_extracted
+              ;;
+            *.tar.gz|*.tgz)
+              tar -xzf "$FILENAME" -C ../toolchain_extracted
+              ;;
+            *.zip)
+              unzip -q "$FILENAME" -d ../toolchain_extracted
+              ;;
+            *)
+              echo "Formato desconocido, no se pudo extraer: $FILENAME"
+              exit 1
+              ;;
+          esac
+          echo "Contenido extraído:"
+          find ../toolchain_extracted -maxdepth 2
+
+      - name: Comprimir extraído como zip para subir
+        run: |
+          cd toolchain_extracted
+          zip -qr "../${{ inputs.release_name }}-${{ github.run_number }}.zip" .
+          cd ..
+          ls -lh "${{ inputs.release_name }}-${{ github.run_number }}.zip"
+
+      - name: Subir contenido extraído como artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.release_name }}-${{ github.run_number }}
+          path: toolchain_extracted/
+          retention-days: 30
+
+      - name: Crear release con el contenido extraído
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.release_name }}-${{ github.run_number }}
+          name: ${{ inputs.release_name }} (run #${{ github.run_number }})
+          files: ${{ inputs.release_name }}-${{ github.run_number }}.zip
+          body: |
+            Toolchain descargado y extraído automáticamente.
+            - Tipo: ${{ inputs.toolchain_type }}
+            - Versión: ${{ inputs.version }}
+            - URL origen: ${{ steps.resolve.outputs.download_url }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
