@@ -1,0 +1,144 @@
+# .github/workflows/kernel-source-fetcher.yml
+name: Kernel Source Fetcher
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: 'Link directo de descarga del kernel source (Samsung Open Source u otro)'
+        required: true
+      compression:
+        description: 'Nivel de compresión para el paquete final'
+        required: true
+        default: '6'
+        type: choice
+        options:
+          - '0'
+          - '3'
+          - '6'
+          - '9'
+      upload_destination:
+        description: 'Destino de subida'
+        required: true
+        default: 'github releases'
+        type: choice
+        options:
+          - 'github releases'
+          - 'artifact'
+      strip_prebuilts:
+        description: 'Eliminar binarios prebuilt pesados innecesarios (reduce tamaño)'
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Liberar espacio en disco
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          sudo docker image prune --all --force || true
+          df -h
+
+      - name: Instalar dependencias
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq xz-utils curl unzip file
+
+      - name: Descargar kernel source
+        run: |
+          mkdir -p download
+          cd download
+          curl -L --fail \
+            -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36" \
+            -o source_package "${{ github.event.inputs.url }}"
+          file source_package
+
+      - name: Detectar tipo real y validar
+        id: detect
+        run: |
+          cd download
+          TYPE=$(file -b --mime-type source_package)
+          echo "Tipo detectado: $TYPE"
+          case "$TYPE" in
+            application/zip) mv source_package source.zip; echo "ext=zip" >> "$GITHUB_OUTPUT" ;;
+            application/gzip|application/x-gzip) mv source_package source.tar.gz; echo "ext=tar.gz" >> "$GITHUB_OUTPUT" ;;
+            application/x-xz) mv source_package source.tar.xz; echo "ext=tar.xz" >> "$GITHUB_OUTPUT" ;;
+            text/html)
+              echo "❌ Se descargó una página HTML, no el archivo. El link probablemente expiró o requiere sesión."
+              head -c 300 source_package
+              exit 1
+              ;;
+            *) echo "❌ Tipo de archivo desconocido: $TYPE"; exit 1 ;;
+          esac
+
+      - name: Extraer paquete principal
+        run: |
+          mkdir -p extracted
+          cd download
+          EXT="${{ steps.detect.outputs.ext }}"
+          case "$EXT" in
+            zip) unzip -q "source.$EXT" -d ../extracted ;;
+            tar.gz) tar -xzf "source.$EXT" -C ../extracted ;;
+            tar.xz) tar -xJf "source.$EXT" -C ../extracted ;;
+          esac
+          echo "Contenido extraído:"
+          find ../extracted -maxdepth 2
+
+      - name: Extraer tar anidados (kernel suele venir dentro de otro tar)
+        run: |
+          find extracted -maxdepth 3 \( -iname "*kernel*.tar.gz" -o -iname "*kernel*.tar.bz2" -o -iname "*kernel*.tar.xz" \) | while read -r inner; do
+            echo "Extrayendo anidado: $inner"
+            DEST=$(dirname "$inner")
+            tar -xf "$inner" -C "$DEST"
+          done
+          echo "Tamaño total tras extracción:"
+          du -sh extracted
+
+      - name: Eliminar prebuilts pesados innecesarios
+        if: ${{ github.event.inputs.strip_prebuilts == 'true' }}
+        run: |
+          find extracted -maxdepth 4 -type d \( -iname "prebuilt*toolchain*" -o -iname "*prebuilts*" \) -exec du -sh {} \;
+          echo "Nota: revisa arriba qué prebuilts se detectaron. Ajusta este paso si quieres borrarlos automáticamente."
+
+      - name: Empaquetar resultado
+        id: package
+        run: |
+          COMPRESSION="${{ github.event.inputs.compression }}"
+          OUTPUT="kernel_source.tar.xz"
+          tar -cf - -C extracted . | xz -${COMPRESSION} -T0 > "$OUTPUT"
+          ls -lh "$OUTPUT"
+          echo "output_file=$OUTPUT" >> "$GITHUB_OUTPUT"
+
+      - name: Obtener tag único para release
+        id: reltag
+        run: |
+          BASE_TAG="kernel-$(date +'%d%m%Y_%H%M%S')"
+          echo "release_tag=$BASE_TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Subir a GitHub Releases
+        if: ${{ github.event.inputs.upload_destination == 'github releases' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.reltag.outputs.release_tag }}
+          name: Kernel Source ${{ steps.reltag.outputs.release_tag }}
+          files: ${{ steps.package.outputs.output_file }}
+          body: |
+            Kernel source descargado automáticamente.
+            - URL origen: ${{ github.event.inputs.url }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Subir como artifact
+        if: ${{ github.event.inputs.upload_destination == 'artifact' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-source-${{ github.run_number }}
+          path: ${{ steps.package.outputs.output_file }}
+          retention-days: 14
